@@ -103,17 +103,26 @@ function layoutRadial(root: LayoutNode, config: MindMapConfig): void {
   root.x = -root.width / 2;
   root.y = -root.height / 2;
 
-  const baseRing = config.structure.horizontalSpacing + 100;
+  const baseRing = config.structure.horizontalSpacing + 120;
 
-  // Increase ring spacing for deeper levels to avoid crowding
+  // Progressive ring spacing to give deeper levels more room
   function radiusForDepth(depth: number): number {
-    return depth * baseRing + (depth > 1 ? (depth - 1) * 30 : 0);
+    return depth * baseRing + (depth > 1 ? (depth - 1) * 40 : 0);
   }
 
-  // Minimum angular gap between siblings to avoid overlap
-  function minAngleForNode(node: LayoutNode, radius: number): number {
-    const nodeSize = Math.max(node.width, node.height) + 16;
-    return radius > 0 ? nodeSize / radius : 0.3;
+  // Minimum angular space a subtree needs, considering all descendants
+  function minSubtreeAngle(node: LayoutNode): number {
+    const r = radiusForDepth(node.depth);
+    const nodeArc = r > 0 ? (Math.max(node.width, node.height) + 20) / r : 0.3;
+
+    if (node.children.length === 0) return nodeArc;
+
+    let childrenTotal = 0;
+    for (const c of node.children) {
+      childrenTotal += minSubtreeAngle(c);
+    }
+
+    return Math.max(nodeArc, childrenTotal);
   }
 
   function positionChildren(
@@ -123,34 +132,47 @@ function layoutRadial(root: LayoutNode, config: MindMapConfig): void {
   ) {
     if (parent.children.length === 0) return;
 
-    const totalLeaves = computeSubtreeLeaves(parent);
     const angleSpan = endAngle - startAngle;
 
-    // Compute the angle each child needs proportionally
+    // Compute the angle each child subtree needs
     const childInfos = parent.children.map((child) => {
       const leaves = computeSubtreeLeaves(child);
-      const r = radiusForDepth(child.depth);
-      const minAngle = minAngleForNode(child, r);
-      const proportional = (leaves / totalLeaves) * angleSpan;
-      return { child, leaves, minAngle, angle: Math.max(proportional, minAngle) };
+      const minAngle = minSubtreeAngle(child);
+      return { child, leaves, minAngle };
     });
 
-    // Normalize if total exceeds span
-    const totalAngle = childInfos.reduce((s, c) => s + c.angle, 0);
-    const scale = totalAngle > angleSpan ? angleSpan / totalAngle : 1;
+    const totalLeaves = childInfos.reduce((s, c) => s + c.leaves, 0);
 
+    // Allocate angles: proportional to leaves, but respecting minimums
+    // Two-pass allocation: first give minimums, then distribute remaining
+    const allocated = childInfos.map((info) => {
+      const proportional = (info.leaves / totalLeaves) * angleSpan;
+      return { ...info, angle: Math.max(proportional, info.minAngle) };
+    });
+
+    // Normalize if total exceeds available span
+    const totalAllocated = allocated.reduce((s, c) => s + c.angle, 0);
+    if (totalAllocated > angleSpan) {
+      const scale = angleSpan / totalAllocated;
+      for (const a of allocated) a.angle *= scale;
+    }
+
+    // Position each child at the center of its allocated sector
+    // CRITICAL: each child's subtree is strictly confined to its sector
     let currentAngle = startAngle;
-    for (const info of childInfos) {
-      const childAngleSpan = info.angle * scale;
-      const midAngle = currentAngle + childAngleSpan / 2;
+    for (const info of allocated) {
+      const childStart = currentAngle;
+      const childEnd = currentAngle + info.angle;
+      const midAngle = (childStart + childEnd) / 2;
       const r = radiusForDepth(info.child.depth);
 
       info.child.x = Math.cos(midAngle) * r - info.child.width / 2;
       info.child.y = Math.sin(midAngle) * r - info.child.height / 2;
       info.child.angle = midAngle;
 
-      positionChildren(info.child, currentAngle, currentAngle + childAngleSpan);
-      currentAngle += childAngleSpan;
+      // Recurse with strictly bounded sector — prevents crossings
+      positionChildren(info.child, childStart, childEnd);
+      currentAngle = childEnd;
     }
   }
 
@@ -236,23 +258,37 @@ function layoutTree(root: LayoutNode, config: MindMapConfig): void {
   root.x = -root.width / 2;
   root.y = -root.height / 2;
 
-  // Balanced distribution: alternate children left/right for visual balance
-  const rightChildren: LayoutNode[] = [];
-  const leftChildren: LayoutNode[] = [];
-  for (let i = 0; i < root.children.length; i++) {
-    if (i % 2 === 0) {
-      rightChildren.push(root.children[i]);
-    } else {
-      leftChildren.push(root.children[i]);
-    }
-  }
-
   function subtreeHeight(node: LayoutNode): number {
     if (node.children.length === 0) return node.height + vSpacing;
     let h = 0;
     for (const c of node.children) h += subtreeHeight(c);
     return Math.max(h, node.height + vSpacing);
   }
+
+  // Balance left/right by subtree weight using a greedy partition.
+  // Children stay in their original order within each side to prevent crossings.
+  // We split at the index that best balances left/right total height.
+  const n = root.children.length;
+  const weights = root.children.map((c) => subtreeHeight(c));
+  const totalWeight = weights.reduce((a, b) => a + b, 0);
+
+  let bestSplit = Math.ceil(n / 2);
+  let bestDiff = Infinity;
+  let cumulative = 0;
+  for (let i = 0; i < n; i++) {
+    cumulative += weights[i];
+    const rightW = cumulative;
+    const leftW = totalWeight - cumulative;
+    const diff = Math.abs(rightW - leftW);
+    if (diff < bestDiff) {
+      bestDiff = diff;
+      bestSplit = i + 1;
+    }
+  }
+
+  // First bestSplit children go right (in order), rest go left (in order)
+  const rightChildren = root.children.slice(0, bestSplit);
+  const leftChildren = root.children.slice(bestSplit);
 
   function assignRight(node: LayoutNode, x: number, yStart: number): void {
     node.x = x;
@@ -300,11 +336,18 @@ function layoutTree(root: LayoutNode, config: MindMapConfig): void {
 }
 
 // ─── Collision Resolution ────────────────────────────────────────────────────
+//
+// Order-preserving: nodes at the same depth are sorted by their current
+// position (y for horizontal layouts, angle for radial) and only pushed
+// apart along that axis. The sibling order from the layout is never swapped,
+// which guarantees edges from a parent to its children never cross.
 
-function resolveCollisions(nodes: LayoutNode[], isRadial: boolean): void {
-  const padding = 12;
+function resolveCollisions(nodes: LayoutNode[], layout: string): void {
+  const padding = 14;
 
-  if (isRadial) {
+  if (layout === 'radial') {
+    // For radial, resolve overlaps by pushing nodes outward (increase radius)
+    // while preserving their angular order. This avoids cross-subtree crossings.
     const byDepth = new Map<number, LayoutNode[]>();
     for (const n of nodes) {
       if (n.depth === 0) continue;
@@ -314,41 +357,64 @@ function resolveCollisions(nodes: LayoutNode[], isRadial: boolean): void {
     }
 
     for (const [, depthNodes] of byDepth) {
+      // Sort by angle — this preserves the layout's angular order
       depthNodes.sort((a, b) => (a.angle ?? 0) - (b.angle ?? 0));
 
-      for (let pass = 0; pass < 5; pass++) {
-        for (let i = 0; i < depthNodes.length; i++) {
-          for (let j = i + 1; j < depthNodes.length; j++) {
-            const a = depthNodes[i];
-            const b = depthNodes[j];
+      for (let pass = 0; pass < 3; pass++) {
+        for (let i = 0; i < depthNodes.length - 1; i++) {
+          const a = depthNodes[i];
+          const b = depthNodes[i + 1]; // only check adjacent nodes in angular order
 
-            const overlapX = Math.min(a.x + a.width + padding, b.x + b.width + padding) - Math.max(a.x, b.x);
-            const overlapY = Math.min(a.y + a.height + padding, b.y + b.height + padding) - Math.max(a.y, b.y);
+          const overlapX = Math.min(a.x + a.width + padding, b.x + b.width + padding) - Math.max(a.x, b.x);
+          const overlapY = Math.min(a.y + a.height + padding, b.y + b.height + padding) - Math.max(a.y, b.y);
 
-            if (overlapX > 0 && overlapY > 0) {
-              const aCx = a.x + a.width / 2;
-              const aCy = a.y + a.height / 2;
-              const bCx = b.x + b.width / 2;
-              const bCy = b.y + b.height / 2;
+          if (overlapX > 0 && overlapY > 0) {
+            // Push apart along the tangential direction (perpendicular to radial)
+            // This preserves the angular order and avoids crossings
+            const aAngle = a.angle ?? 0;
+            const bAngle = b.angle ?? 0;
+            const midAngle = (aAngle + bAngle) / 2;
+            // Tangent direction is perpendicular to radial
+            const tangentX = -Math.sin(midAngle);
+            const tangentY = Math.cos(midAngle);
 
-              const dx = bCx - aCx;
-              const dy = bCy - aCy;
-              const dist = Math.sqrt(dx * dx + dy * dy) || 1;
+            const push = Math.min(overlapX, overlapY) / 2 + padding / 2;
 
-              const pushDist = Math.min(overlapX, overlapY) / 2 + padding / 2;
-              const px = (dx / dist) * pushDist;
-              const py = (dy / dist) * pushDist;
+            // Push a in negative tangent, b in positive tangent
+            a.x -= tangentX * push;
+            a.y -= tangentY * push;
+            shiftSubtree(a, 0, -tangentX * push, -tangentY * push);
 
-              a.x -= px;
-              a.y -= py;
-              b.x += px;
-              b.y += py;
-            }
+            b.x += tangentX * push;
+            b.y += tangentY * push;
+            shiftSubtree(b, 0, tangentX * push, tangentY * push);
           }
         }
       }
     }
+  } else if (layout === 'vertical') {
+    // Vertical layout: sort by x position, push apart horizontally
+    const byDepth = new Map<number, LayoutNode[]>();
+    for (const n of nodes) {
+      const arr = byDepth.get(n.depth) || [];
+      arr.push(n);
+      byDepth.set(n.depth, arr);
+    }
+
+    for (const [, depthNodes] of byDepth) {
+      depthNodes.sort((a, b) => a.x - b.x);
+      for (let i = 1; i < depthNodes.length; i++) {
+        const prev = depthNodes[i - 1];
+        const curr = depthNodes[i];
+        const overlap = prev.x + prev.width + padding - curr.x;
+        if (overlap > 0) {
+          curr.x += overlap;
+          shiftSubtreeXY(curr, overlap, 0);
+        }
+      }
+    }
   } else {
+    // Horizontal and tree layouts: sort by y position, push apart vertically
     const byDepth = new Map<number, LayoutNode[]>();
     for (const n of nodes) {
       const arr = byDepth.get(n.depth) || [];
@@ -364,17 +430,26 @@ function resolveCollisions(nodes: LayoutNode[], isRadial: boolean): void {
         const overlap = prev.y + prev.height + padding - curr.y;
         if (overlap > 0) {
           curr.y += overlap;
-          shiftSubtree(curr, overlap);
+          shiftSubtreeXY(curr, 0, overlap);
         }
       }
     }
   }
 }
 
-function shiftSubtree(node: LayoutNode, dy: number): void {
+function shiftSubtree(node: LayoutNode, _dy: number, dx: number, dy: number): void {
   for (const child of node.children) {
+    child.x += dx;
     child.y += dy;
-    shiftSubtree(child, dy);
+    shiftSubtree(child, 0, dx, dy);
+  }
+}
+
+function shiftSubtreeXY(node: LayoutNode, dx: number, dy: number): void {
+  for (const child of node.children) {
+    child.x += dx;
+    child.y += dy;
+    shiftSubtreeXY(child, dx, dy);
   }
 }
 
@@ -425,8 +500,7 @@ export function computeLayout(
   }
 
   const nodes = collectNodes(root);
-  const isRadial = config.structure.layout === 'radial';
-  resolveCollisions(nodes, isRadial);
+  resolveCollisions(nodes, config.structure.layout);
   const edges = collectEdges(root);
   const bounds = computeBounds(nodes);
 

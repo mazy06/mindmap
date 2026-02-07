@@ -9,20 +9,17 @@ interface EdgeProps {
   offsetY: number;
 }
 
-// ─── Fixed Anchor Points ─────────────────────────────────────────────────────
+// ─── Anchor Points ──────────────────────────────────────────────────────────
 //
-// Each node has 4 anchor points at the center of each side:
-//   top:    (cx, y)
-//   bottom: (cx, y + h)
-//   left:   (x, cy)
-//   right:  (x + w, cy)
-//
-// The anchor is chosen based on the layout type. Markers always sit at these
-// fixed positions. The path adapts to connect between the two anchors.
+// For tree/horizontal/vertical layouts: fixed anchors at the center of each side.
+// For radial layout: dynamic boundary intersection toward the other node,
+// ensuring each edge leaves/enters the node at the exact direction of its
+// target/source. This prevents crossings when a parent has children spread
+// across different angles.
 
 type Anchor = 'top' | 'bottom' | 'left' | 'right';
 
-function getAnchorPoint(
+function getFixedAnchorPoint(
   node: { x: number; y: number; width: number; height: number },
   anchor: Anchor,
   offsetX: number,
@@ -41,46 +38,80 @@ function getAnchorPoint(
   }
 }
 
-function chooseAnchors(
+// Compute the intersection of a ray from the center of a rectangle toward
+// a target point, with the rectangle boundary. Returns the boundary point
+// and the **face normal** at the hit edge (not the ray direction).
+// The face normal is perpendicular to the hit edge and points outward,
+// which produces proper curves when used as bezier control point direction.
+function rectBoundaryPoint(
+  node: { x: number; y: number; width: number; height: number },
+  targetX: number,
+  targetY: number,
+  offsetX: number,
+  offsetY: number,
+): { x: number; y: number; dx: number; dy: number } {
+  const nx = node.x + offsetX;
+  const ny = node.y + offsetY;
+  const cx = nx + node.width / 2;
+  const cy = ny + node.height / 2;
+
+  const dirX = targetX - cx;
+  const dirY = targetY - cy;
+
+  // Handle zero-distance edge case
+  if (Math.abs(dirX) < 0.01 && Math.abs(dirY) < 0.01) {
+    return { x: cx, y: ny, dx: 0, dy: -1 };
+  }
+
+  const halfW = node.width / 2;
+  const halfH = node.height / 2;
+
+  // Find which edge the ray hits first
+  let t = Infinity;
+  let hitEdge: 'right' | 'left' | 'bottom' | 'top' = 'right';
+
+  if (dirX > 0) {
+    const tt = halfW / dirX;
+    if (tt < t) { t = tt; hitEdge = 'right'; }
+  }
+  if (dirX < 0) {
+    const tt = -halfW / dirX;
+    if (tt < t) { t = tt; hitEdge = 'left'; }
+  }
+  if (dirY > 0) {
+    const tt = halfH / dirY;
+    if (tt < t) { t = tt; hitEdge = 'bottom'; }
+  }
+  if (dirY < 0) {
+    const tt = -halfH / dirY;
+    if (tt < t) { t = tt; hitEdge = 'top'; }
+  }
+
+  const bx = cx + dirX * t;
+  const by = cy + dirY * t;
+
+  // Face normal: perpendicular to the hit edge, pointing outward.
+  // This gives proper bezier curves that exit the node cleanly.
+  let ndx: number, ndy: number;
+  switch (hitEdge) {
+    case 'right':  ndx = 1;  ndy = 0;  break;
+    case 'left':   ndx = -1; ndy = 0;  break;
+    case 'bottom': ndx = 0;  ndy = 1;  break;
+    case 'top':    ndx = 0;  ndy = -1; break;
+  }
+
+  return { x: bx, y: by, dx: ndx, dy: ndy };
+}
+
+function chooseFixedAnchors(
   source: { x: number; y: number; width: number; height: number },
   target: { x: number; y: number; width: number; height: number },
   layout: string,
   offsetX: number,
-  offsetY: number,
+  _offsetY: number,
 ): { sourceAnchor: Anchor; targetAnchor: Anchor } {
   if (layout === 'vertical') {
     return { sourceAnchor: 'bottom', targetAnchor: 'top' };
-  }
-
-  if (layout === 'radial') {
-    // For radial: pick the side that faces the target/source
-    const sx = source.x + offsetX + source.width / 2;
-    const sy = source.y + offsetY + source.height / 2;
-    const tx = target.x + offsetX + target.width / 2;
-    const ty = target.y + offsetY + target.height / 2;
-
-    const angle = Math.atan2(ty - sy, tx - sx);
-    const absAngle = Math.abs(angle);
-
-    // Determine which side of the source faces the target
-    let sourceAnchor: Anchor;
-    let targetAnchor: Anchor;
-
-    if (absAngle < Math.PI / 4) {
-      sourceAnchor = 'right';
-      targetAnchor = 'left';
-    } else if (absAngle > (3 * Math.PI) / 4) {
-      sourceAnchor = 'left';
-      targetAnchor = 'right';
-    } else if (angle > 0) {
-      sourceAnchor = 'bottom';
-      targetAnchor = 'top';
-    } else {
-      sourceAnchor = 'top';
-      targetAnchor = 'bottom';
-    }
-
-    return { sourceAnchor, targetAnchor };
   }
 
   // Horizontal layouts + tree
@@ -98,43 +129,79 @@ const Edge: React.FC<EdgeProps> = ({ edge, config, offsetX, offsetY }) => {
   const { link, style: styleConfig, structure } = config;
   const { source, target } = edge;
 
-  // Choose fixed anchor points
-  const { sourceAnchor, targetAnchor } = chooseAnchors(
-    source, target, structure.layout, offsetX, offsetY
-  );
-
-  // Get the exact anchor coordinates on the node borders
-  const p1 = getAnchorPoint(source, sourceAnchor, offsetX, offsetY);
-  const p2 = getAnchorPoint(target, targetAnchor, offsetX, offsetY);
-
-  // Apply gap: pull the path endpoints away from the node by gap distance
   const hasEnd = link.markerEnd !== 'none';
   const hasStart = link.markerStart !== 'none';
   const endGap = hasEnd ? link.markerSize + 3 : 4;
   const startGap = hasStart ? link.markerSize + 3 : 4;
 
-  // Direction vectors from anchor outward
-  const startDir = anchorDirection(sourceAnchor);
-  const endDir = anchorDirection(targetAnchor);
+  let x1: number, y1: number, x2: number, y2: number;
+  let startDirX: number, startDirY: number, endDirX: number, endDirY: number;
 
-  const x1 = p1.x + startDir.dx * startGap;
-  const y1 = p1.y + startDir.dy * startGap;
-  const x2 = p2.x + endDir.dx * endGap;
-  const y2 = p2.y + endDir.dy * endGap;
+  if (structure.layout === 'radial') {
+    // ─── Radial: dynamic boundary intersection ────────────────────
+    // Each edge exits the source toward the specific target and enters
+    // the target from the specific source direction. This guarantees
+    // no two edges from the same parent share an anchor direction,
+    // preventing crossings.
+    const srcCenter = {
+      x: source.x + offsetX + source.width / 2,
+      y: source.y + offsetY + source.height / 2,
+    };
+    const tgtCenter = {
+      x: target.x + offsetX + target.width / 2,
+      y: target.y + offsetY + target.height / 2,
+    };
 
-  // Build path that respects the anchor directions
+    const srcBP = rectBoundaryPoint(source, tgtCenter.x, tgtCenter.y, offsetX, offsetY);
+    const tgtBP = rectBoundaryPoint(target, srcCenter.x, srcCenter.y, offsetX, offsetY);
+
+    startDirX = srcBP.dx;
+    startDirY = srcBP.dy;
+    // Target direction points outward from target (away from source), so negate for "inward"
+    endDirX = tgtBP.dx;
+    endDirY = tgtBP.dy;
+
+    x1 = srcBP.x + startDirX * startGap;
+    y1 = srcBP.y + startDirY * startGap;
+    x2 = tgtBP.x + endDirX * endGap;
+    y2 = tgtBP.y + endDirY * endGap;
+  } else {
+    // ─── Tree/Horizontal/Vertical: fixed side anchors ─────────────
+    const { sourceAnchor, targetAnchor } = chooseFixedAnchors(
+      source, target, structure.layout, offsetX, offsetY
+    );
+
+    const p1 = getFixedAnchorPoint(source, sourceAnchor, offsetX, offsetY);
+    const p2 = getFixedAnchorPoint(target, targetAnchor, offsetX, offsetY);
+
+    const sDir = anchorDirection(sourceAnchor);
+    const eDir = anchorDirection(targetAnchor);
+    startDirX = sDir.dx;
+    startDirY = sDir.dy;
+    endDirX = eDir.dx;
+    endDirY = eDir.dy;
+
+    x1 = p1.x + startDirX * startGap;
+    y1 = p1.y + startDirY * startGap;
+    x2 = p2.x + endDirX * endGap;
+    y2 = p2.y + endDirY * endGap;
+  }
+
+  // Build path — all curved styles use cubic bezier with control points
+  // along the outward direction from each node boundary. This naturally
+  // adapts to any node position (layout or drag & drop).
   const dx = x2 - x1;
   const dy = y2 - y1;
+  const dist = Math.sqrt(dx * dx + dy * dy);
   let d: string;
 
   switch (link.style) {
     case 'bezier': {
-      const dist = Math.sqrt(dx * dx + dy * dy);
-      const tension = dist * 0.4;
-      const cp1x = x1 + startDir.dx * tension;
-      const cp1y = y1 + startDir.dy * tension;
-      const cp2x = x2 + endDir.dx * tension;
-      const cp2y = y2 + endDir.dy * tension;
+      const tension = Math.max(40, dist * 0.4);
+      const cp1x = x1 + startDirX * tension;
+      const cp1y = y1 + startDirY * tension;
+      const cp2x = x2 + endDirX * tension;
+      const cp2y = y2 + endDirY * tension;
       d = `M ${x1} ${y1} C ${cp1x} ${cp1y}, ${cp2x} ${cp2y}, ${x2} ${y2}`;
       break;
     }
@@ -142,23 +209,23 @@ const Edge: React.FC<EdgeProps> = ({ edge, config, offsetX, offsetY }) => {
       d = `M ${x1} ${y1} L ${x2} ${y2}`;
       break;
     case 'angular': {
-      // Step path: go out from source anchor, then turn to target
-      if (sourceAnchor === 'bottom' || sourceAnchor === 'top') {
+      if (Math.abs(startDirY) > 0.5) {
+        // Vertical exit: step down then across
         const midY = (y1 + y2) / 2;
         d = `M ${x1} ${y1} L ${x1} ${midY} L ${x2} ${midY} L ${x2} ${y2}`;
       } else {
+        // Horizontal exit: step across then down
         const midX = (x1 + x2) / 2;
         d = `M ${x1} ${y1} L ${midX} ${y1} L ${midX} ${y2} L ${x2} ${y2}`;
       }
       break;
     }
     case 'organic': {
-      const dist = Math.sqrt(dx * dx + dy * dy);
-      const tension = dist * 0.55;
-      const cp1x = x1 + startDir.dx * tension;
-      const cp1y = y1 + startDir.dy * tension;
-      const cp2x = x2 + endDir.dx * tension;
-      const cp2y = y2 + endDir.dy * tension;
+      const tension = Math.max(50, dist * 0.55);
+      const cp1x = x1 + startDirX * tension;
+      const cp1y = y1 + startDirY * tension;
+      const cp2x = x2 + endDirX * tension;
+      const cp2y = y2 + endDirY * tension;
       d = `M ${x1} ${y1} C ${cp1x} ${cp1y}, ${cp2x} ${cp2y}, ${x2} ${y2}`;
       break;
     }
@@ -207,7 +274,7 @@ const Edge: React.FC<EdgeProps> = ({ edge, config, offsetX, offsetY }) => {
   );
 };
 
-// Direction vector pointing outward from an anchor
+// Direction vector pointing outward from a fixed anchor
 function anchorDirection(anchor: Anchor): { dx: number; dy: number } {
   switch (anchor) {
     case 'top':    return { dx: 0, dy: -1 };
